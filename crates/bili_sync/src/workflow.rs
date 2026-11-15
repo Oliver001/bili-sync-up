@@ -4448,6 +4448,7 @@ async fn download_video_pages(
                                 &base_folder_name,
                                 &video_model,
                                 &video_model.pubtime.format("%Y%m%d%H%M%S").to_string(),
+                                &pages,
                             );
                             video_source_base_path.join(&unique_folder_name)
                         } else {
@@ -4533,6 +4534,7 @@ async fn download_video_pages(
                     &base_folder_name,
                     &final_video_model,
                     &final_video_model.pubtime.format("%Y%m%d%H%M%S").to_string(),
+                    &pages,
                 );
                 debug!("使用去重文件夹名: '{}'", unique_folder_name);
                 let final_path = video_source_base_path.join(&unique_folder_name);
@@ -15601,7 +15603,7 @@ fn collect_folder_identity_names(folder_path: &std::path::Path, depth: usize, na
     }
 }
 
-fn is_same_video_folder(folder_path: &std::path::Path, video_model: &video::Model) -> bool {
+fn is_same_video_folder(folder_path: &std::path::Path, video_model: &video::Model, pages: &[page::Model]) -> bool {
     use std::sync::OnceLock;
 
     static BVID_RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -15639,9 +15641,6 @@ fn is_same_video_folder(folder_path: &std::path::Path, video_model: &video::Mode
         return true;
     }
 
-    let mut found_media_files = false;
-    let mut found_bvid_files = false;
-    let mut found_title_files = false;
     let mut found_other_bvid_files = false;
 
     // 先看目录内是否已有明确的视频身份。若目录里是别的 BVID，不能再用同标题/同 DB 路径误判。
@@ -15677,42 +15676,6 @@ fn is_same_video_folder(folder_path: &std::path::Path, video_model: &video::Mode
             .any(|matched| matched.as_str() != current_bvid)
         {
             found_other_bvid_files = true;
-            found_bvid_files = true;
-        }
-
-        if file_name_str.ends_with(".tmp_video")
-            || file_name_str.ends_with(".tmp_audio")
-            || file_name_str.ends_with(".tmp_flv")
-            || file_name_str.ends_with(".mp4")
-            || file_name_str.ends_with(".mkv")
-            || file_name_str.ends_with(".flv")
-            || file_name_str.ends_with(".webm")
-            || file_name_str.ends_with(".m4a")
-            || file_name_str.ends_with(".mp3")
-            || file_name_str.ends_with(".flac")
-            || file_name_str.ends_with(".aac")
-            || file_name_str.ends_with(".ogg")
-            || file_name_str.ends_with(".nfo")
-            || file_name_str.ends_with(".jpg")
-            || file_name_str.ends_with(".png")
-            || file_name_str.ends_with(".ass")
-            || file_name_str.ends_with(".srt")
-        {
-            found_media_files = true;
-        }
-
-        let video_title_clean = video_model
-            .name
-            .to_lowercase()
-            .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "");
-        if !video_title_clean.is_empty() && video_title_clean.len() > 3 {
-            let title_keywords: Vec<&str> = video_title_clean.split_whitespace().take(3).collect();
-            if title_keywords
-                .iter()
-                .any(|keyword| keyword.len() > 2 && file_name_str.contains(keyword))
-            {
-                found_title_files = true;
-            }
         }
     }
 
@@ -15722,6 +15685,18 @@ fn is_same_video_folder(folder_path: &std::path::Path, video_model: &video::Mode
             folder_path
         );
         return false;
+    }
+
+    // 数据库里记着分P文件落在哪个目录，这是「这个目录属于当前视频」最硬的证据：
+    // 每页下载（成功、失败、中断）后都会写 page.path，据此可以安全复用上次写过的目录，
+    // 不会因为另选目录而在旧目录里留下孤儿文件、也不会把已下完的分P重下一遍。
+    if pages
+        .iter()
+        .filter_map(|page| page.path.as_deref())
+        .any(|page_path| path_text_is_same_or_child(page_path, folder_path))
+    {
+        debug!("✓ 数据库分P路径位于该目录，确认为同一视频文件夹: {:?}", folder_path);
+        return true;
     }
 
     // 方法1：增强的数据库路径匹配
@@ -15741,44 +15716,17 @@ fn is_same_video_folder(folder_path: &std::path::Path, video_model: &video::Mode
         return true;
     }
 
-    // 1.3 文件夹名称匹配（原有逻辑）
-    if let Some(db_folder_name) = db_path.file_name() {
-        if let Some(check_folder_name) = folder_path.file_name() {
-            if db_folder_name == check_folder_name {
-                debug!("✓ 通过文件夹名称匹配确认为同一视频文件夹");
-                return true;
-            }
-        }
-    }
-
-    // 1.4 相对路径后缀匹配
-    if let Some(db_folder_name) = db_path.file_name() {
-        if folder_path.ends_with(db_folder_name) {
-            debug!("✓ 通过路径后缀匹配确认为同一视频文件夹");
-            return true;
-        }
-    }
-
-    if folder_leaf_contains_video_identity(db_path, video_model) && found_media_files && found_title_files {
-        debug!(
-            "✓ DB旧路径带当前视频身份，且目录内已有同标题下载文件，复用当前下载目录: {:?}",
-            folder_path
-        );
+    // 1.3 相对路径后缀匹配。
+    // 只比「末级目录名」是不成立的：不同父目录下的同名目录（换过视频源目录、多个源指向同一 UP）
+    // 会互相串用，结果是新视频写进别人的目录、同名文件覆盖。相对路径按**整段**后缀比才算数。
+    if db_path.is_relative() && !video_model.path.trim().is_empty() && folder_path.ends_with(db_path) {
+        debug!("✓ 通过相对路径后缀匹配确认为同一视频文件夹");
         return true;
     }
 
-    debug!("⚠ 数据库路径匹配失败，尝试文件内容检测");
-
-    debug!(
-        "文件检测结果: 媒体文件={}, BVID文件={}, 标题文件={}",
-        found_media_files, found_bvid_files, found_title_files
-    );
-
-    // 标题相同不能证明是同一个视频，只作为可疑信息记录。
-    if found_media_files || found_bvid_files || found_title_files {
-        debug!("⚠ 文件夹包含相关文件但无法确认为同一视频文件夹: {:?}", folder_path);
-    }
-
+    // 标题出现在目录内文件名里不能作为归属证据：不同视频同名标题很常见（多P默认模板
+    // `P01.分P标题` 本身就带分P标题），凭标题把两个视频并进同一目录会导致同名文件互相覆盖。
+    // 宁可多开一个目录，也不能误合并。
     debug!("✗ 无法确认为同一视频文件夹: {:?}", folder_path);
     debug!("=== 智能冲突检测结束 ===");
     false
@@ -15960,7 +15908,7 @@ fn preserve_existing_video_path_for_redownload(
         .as_ref()
         .map(|base_path| path_is_same_path(&computed_path, base_path))
         .unwrap_or(false)
-        && (has_page_under_computed_path || is_same_video_folder(&computed_path, video_model))
+        && (has_page_under_computed_path || is_same_video_folder(&computed_path, video_model, pages))
     {
         debug!(
             "重置/重下发现旧视频目录仅带唯一标识，基础目录已有当前视频内容，使用基础目录: bvid={}, existing='{}', computed='{}'",
@@ -16027,6 +15975,7 @@ pub fn generate_unique_folder_name(
     base_name: &str,
     video_model: &video::Model,
     pubtime: &str,
+    pages: &[page::Model],
 ) -> String {
     let mut unique_name = base_name.to_string();
 
@@ -16037,7 +15986,7 @@ pub fn generate_unique_folder_name(
     }
 
     // 如果存在，智能检查这个文件夹是否就是当前视频的文件夹
-    if is_same_video_folder(&base_path, video_model) {
+    if is_same_video_folder(&base_path, video_model, pages) {
         debug!("文件夹 {:?} 已是当前视频的文件夹，无需生成新名称", base_path);
         return unique_name;
     }
@@ -16048,7 +15997,7 @@ pub fn generate_unique_folder_name(
     // 真实冲突时固定使用完整发布时间+BVID，同一个视频永远落到同一个目录。
     unique_name = format!("{}-{}", base_name, video_identity_suffix(video_model, pubtime));
     let identity_path = parent_dir.join(&unique_name);
-    if is_same_video_folder(&identity_path, video_model) {
+    if is_same_video_folder(&identity_path, video_model, pages) {
         debug!("文件夹 {:?} 已是当前视频的文件夹，无需生成新名称", identity_path);
         return unique_name;
     }
@@ -17647,7 +17596,7 @@ mod tests {
             ..Default::default()
         };
 
-        let unique_name = generate_unique_folder_name(&parent_dir, "测试UP/喵", &video, "20260428170830");
+        let unique_name = generate_unique_folder_name(&parent_dir, "测试UP/喵", &video, "20260428170830", &[]);
 
         assert_eq!(unique_name, "测试UP/喵-20260428170830-BV1TestReuse001");
         fs::remove_dir_all(parent_dir).expect("应能清理临时目录");
@@ -17669,7 +17618,7 @@ mod tests {
             ..Default::default()
         };
 
-        let unique_name = generate_unique_folder_name(&parent_dir, "测试UP/喵", &video, "20260428170830");
+        let unique_name = generate_unique_folder_name(&parent_dir, "测试UP/喵", &video, "20260428170830", &[]);
 
         assert_eq!(unique_name, "测试UP/喵-20260428170830-BV1TestReuse002");
         fs::remove_dir_all(parent_dir).expect("应能清理临时目录");
@@ -17691,7 +17640,7 @@ mod tests {
             ..Default::default()
         };
 
-        let unique_name = generate_unique_folder_name(&parent_dir, "测试UP/喵", &video, "20260428170830");
+        let unique_name = generate_unique_folder_name(&parent_dir, "测试UP/喵", &video, "20260428170830", &[]);
 
         assert_eq!(unique_name, "测试UP/喵-20260428170830-BV1TestFallback");
         fs::remove_dir_all(parent_dir).expect("应能清理临时目录");
@@ -17714,14 +17663,14 @@ mod tests {
             ..Default::default()
         };
 
-        let unique_name = generate_unique_folder_name(&parent_dir, "测试UP/喵", &video, "20260428170830");
+        let unique_name = generate_unique_folder_name(&parent_dir, "测试UP/喵", &video, "20260428170830", &[]);
 
         assert_eq!(unique_name, "测试UP/喵-20260428170830-BV1NewVideo1");
         fs::remove_dir_all(parent_dir).expect("应能清理临时目录");
     }
 
     #[test]
-    fn test_generate_unique_folder_name_reuses_partial_download_dir_from_identity_db_path() {
+    fn test_generate_unique_folder_name_falls_back_to_identity_dir_without_filename_evidence() {
         let parent_dir = unique_temp_dir("dedup-partial-download-dir");
         let upper_dir = parent_dir.join("测试UP");
         let title_dir = upper_dir.join("喵");
@@ -17746,9 +17695,178 @@ mod tests {
             ..Default::default()
         };
 
-        let unique_name = generate_unique_folder_name(&parent_dir, "测试UP/喵", &video, "20260428170830");
+        let unique_name = generate_unique_folder_name(&parent_dir, "测试UP/喵", &video, "20260428170830", &[]);
 
-        assert_eq!(unique_name, "测试UP/喵");
+        // 目录内文件名不含 BVID / CID，仅凭「同标题」不能复用基础目录，落到身份目录。
+        assert_eq!(unique_name, "测试UP/喵-20260428170830-BV1PartialReuse");
+        fs::remove_dir_all(parent_dir).expect("应能清理临时目录");
+    }
+
+    /// 回归：两个不同视频同名同标题、目录内文件名又不含 BVID 时，不能凭标题关键词
+    /// 把新视频并进别人的目录——否则同名文件会直接覆盖。
+    #[test]
+    fn test_generate_unique_folder_name_does_not_merge_into_other_video_title_folder() {
+        let parent_dir = unique_temp_dir("dedup-shared-title");
+        let upper_dir = parent_dir.join("测试UP");
+        let other_dir = upper_dir.join("每日新闻");
+        fs::create_dir_all(&other_dir).expect("应能创建另一个视频的目录");
+        fs::write(other_dir.join("每日新闻.mp4"), b"other").expect("应能创建另一个视频的文件");
+        fs::write(other_dir.join("每日新闻.nfo"), b"other").expect("应能创建另一个视频的 NFO");
+
+        let video = video::Model {
+            name: "每日新闻".to_string(),
+            upper_name: "测试UP".to_string(),
+            bvid: "BV1SameTitl1".to_string(),
+            cid: Some(112233),
+            path: upper_dir
+                .join("每日新闻-20260202000000-BV1SameTitl1")
+                .to_string_lossy()
+                .to_string(),
+            pubtime: chrono::NaiveDate::from_ymd_opt(2026, 2, 2)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            ..Default::default()
+        };
+
+        let unique_name = generate_unique_folder_name(&parent_dir, "测试UP/每日新闻", &video, "20260202000000", &[]);
+
+        assert_eq!(unique_name, "测试UP/每日新闻-20260202000000-BV1SameTitl1");
+        fs::remove_dir_all(parent_dir).expect("应能清理临时目录");
+    }
+
+    /// 回归：多P默认模板（`P01.分P标题`）不含 BVID，标题是带空格的西文时，
+    /// 分P文件名天然带标题关键词，旧逻辑在默认配置下就会把两个视频并成一个。
+    #[test]
+    fn test_generate_unique_folder_name_does_not_merge_into_other_multipage_folder() {
+        let parent_dir = unique_temp_dir("dedup-shared-title-multipage");
+        let upper_dir = parent_dir.join("测试UP");
+        let other_dir = upper_dir.join("Live Replay");
+        fs::create_dir_all(&other_dir).expect("应能创建另一个视频的目录");
+        fs::write(other_dir.join("P01.Live Replay Day1.mp4"), b"other").expect("应能创建另一个视频的分P文件");
+        fs::write(other_dir.join("P02.Live Replay Day2.mp4"), b"other").expect("应能创建另一个视频的分P文件");
+
+        let video = video::Model {
+            name: "Live Replay".to_string(),
+            upper_name: "测试UP".to_string(),
+            bvid: "BV1LiveRepl1".to_string(),
+            cid: Some(445566),
+            single_page: Some(false),
+            path: upper_dir
+                .join("Live Replay-20260404000000-BV1LiveRepl1")
+                .to_string_lossy()
+                .to_string(),
+            pubtime: chrono::NaiveDate::from_ymd_opt(2026, 4, 4)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            ..Default::default()
+        };
+
+        let unique_name = generate_unique_folder_name(&parent_dir, "测试UP/Live Replay", &video, "20260404000000", &[]);
+
+        assert_eq!(unique_name, "测试UP/Live Replay-20260404000000-BV1LiveRepl1");
+        fs::remove_dir_all(parent_dir).expect("应能清理临时目录");
+    }
+
+    /// 回归：上次下载（可能是失败/中断）把分P写在了基础目录里，`page.path` 有记录时必须复用该目录，
+    /// 不能另开身份目录——否则旧目录里的临时文件/已下完分P会变成永久孤儿（上万条视频时清理不动）。
+    #[test]
+    fn test_generate_unique_folder_name_reuses_dir_recorded_in_page_path() {
+        let parent_dir = unique_temp_dir("dedup-page-path-reuse");
+        let upper_dir = parent_dir.join("测试UP");
+        let title_dir = upper_dir.join("每日新闻");
+        fs::create_dir_all(&title_dir).expect("应能创建上次下载用的目录");
+        fs::write(title_dir.join("每日新闻.mp4.tmp_video"), b"partial").expect("应能创建未完成的临时文件");
+
+        let video = video::Model {
+            name: "每日新闻".to_string(),
+            upper_name: "测试UP".to_string(),
+            bvid: "BV1SameTitl1".to_string(),
+            cid: Some(112233),
+            // 首次下载未完成时 video.path 还没落库，目录归属只能靠 page.path。
+            path: String::new(),
+            pubtime: chrono::NaiveDate::from_ymd_opt(2026, 2, 2)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            ..Default::default()
+        };
+        let pages = vec![page::Model {
+            path: Some(title_dir.join("每日新闻.mp4").to_string_lossy().to_string()),
+            ..Default::default()
+        }];
+
+        let unique_name = generate_unique_folder_name(&parent_dir, "测试UP/每日新闻", &video, "20260202000000", &pages);
+
+        assert_eq!(unique_name, "测试UP/每日新闻");
+        fs::remove_dir_all(parent_dir).expect("应能清理临时目录");
+    }
+
+    /// 反向用例：`page.path` 落在别的目录时，不能因为同标题就复用这个目录。
+    #[test]
+    fn test_generate_unique_folder_name_ignores_page_path_outside_candidate_dir() {
+        let parent_dir = unique_temp_dir("dedup-page-path-elsewhere");
+        let upper_dir = parent_dir.join("测试UP");
+        let other_dir = upper_dir.join("每日新闻");
+        fs::create_dir_all(&other_dir).expect("应能创建另一个视频的目录");
+        fs::write(other_dir.join("每日新闻.mp4"), b"other").expect("应能创建另一个视频的文件");
+
+        let video = video::Model {
+            name: "每日新闻".to_string(),
+            upper_name: "测试UP".to_string(),
+            bvid: "BV1SameTitl1".to_string(),
+            cid: Some(112233),
+            path: String::new(),
+            pubtime: chrono::NaiveDate::from_ymd_opt(2026, 2, 2)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            ..Default::default()
+        };
+        let pages = vec![page::Model {
+            path: Some(
+                upper_dir
+                    .join("每日新闻-20260202000000-BV1SameTitl1")
+                    .join("每日新闻.mp4")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            ..Default::default()
+        }];
+
+        let unique_name = generate_unique_folder_name(&parent_dir, "测试UP/每日新闻", &video, "20260202000000", &pages);
+
+        assert_eq!(unique_name, "测试UP/每日新闻-20260202000000-BV1SameTitl1");
+        fs::remove_dir_all(parent_dir).expect("应能清理临时目录");
+    }
+
+    #[test]
+    fn test_generate_unique_folder_name_does_not_merge_same_leaf_dir_under_other_parent() {
+        let parent_dir = unique_temp_dir("dedup-same-leaf-other-parent");
+        let upper_dir = parent_dir.join("测试UP");
+        let other_dir = upper_dir.join("每日新闻");
+        fs::create_dir_all(&other_dir).expect("应能创建另一个视频的目录");
+        fs::write(other_dir.join("每日新闻.mp4"), b"other").expect("应能创建另一个视频的文件");
+
+        // 视频源目录改过（或另一个源指向同一 UP）：数据库里存的旧目录与候选目录**末级同名但父目录不同**。
+        // 只比末级目录名会把另一个视频的目录当成自己的，照样覆盖别人。
+        let video = video::Model {
+            name: "每日新闻".to_string(),
+            upper_name: "测试UP".to_string(),
+            bvid: "BV1SameTitl2".to_string(),
+            cid: Some(112234),
+            path: parent_dir.join("旧源/测试UP/每日新闻").to_string_lossy().to_string(),
+            pubtime: chrono::NaiveDate::from_ymd_opt(2026, 2, 2)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            ..Default::default()
+        };
+
+        let unique_name = generate_unique_folder_name(&parent_dir, "测试UP/每日新闻", &video, "20260202000000", &[]);
+
+        assert_eq!(unique_name, "测试UP/每日新闻-20260202000000-BV1SameTitl2");
         fs::remove_dir_all(parent_dir).expect("应能清理临时目录");
     }
 
@@ -17769,7 +17887,7 @@ mod tests {
             ..Default::default()
         };
 
-        let unique_name = generate_unique_folder_name(&parent_dir, "测试UP/喵", &video, "20260428170830");
+        let unique_name = generate_unique_folder_name(&parent_dir, "测试UP/喵", &video, "20260428170830", &[]);
 
         assert_eq!(unique_name, "测试UP/喵");
         fs::remove_dir_all(parent_dir).expect("应能清理临时目录");
