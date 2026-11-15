@@ -17,8 +17,16 @@ pub const MAX_BASENAME_BYTES: usize = 235;
 const UNIX_SEP_PLACEHOLDER: &str = "🔒UNIX_SEP_PROTECTED🔒";
 const WIN_SEP_PLACEHOLDER: &str = "🔒WIN_SEP_PROTECTED🔒";
 
+/// 文件名安全化（默认入口）。
+///
+/// 始终保护模板路径分隔符标记（`__UNIX_SEP__` / `__WIN_SEP__`）：
+/// 模板渲染链路（`PathSafeTemplate::path_safe_render`、`ConfigBundle::render_template_safe`）
+/// 会先把模板里的 `/`、`\` 替换成这两个标记，渲染完成后再还原为真实分隔符。
+/// 此前非保护模式下，清理步骤（`[_ ]{3,}` → `_` 等）会把紧邻的空格/下划线
+/// 与标记前缀一起吞掉，导致 `标题 __UNIX_SEP__子目录` 变成 `标题_UNIX_SEP__子目录`，
+/// 分隔符永久丢失。因此统一走保护模式，标记在整个安全化过程中原样保留。
 pub fn filenamify<S: AsRef<str>>(input: S) -> String {
-    filenamify_with_options(input, false)
+    filenamify_with_options(input, true)
 }
 
 /// 按 UTF-8 字节数截断字符串（保证不会截断字符），并清理截断后残留的
@@ -145,8 +153,10 @@ pub fn filenamify_with_options<S: AsRef<str>>(input: S, preserve_template_separa
     // Unicode控制字符：\u{0000}-\u{001F} \u{007F} \u{0080}-\u{009F}
     let reserved = regex!("[<>:\"/\\\\|?*\u{0000}-\u{001F}\u{007F}\u{0080}-\u{009F}]+");
 
-    // Windows保留名称：CON, PRN, AUX, NUL, COM1-COM9, LPT1-LPT9（不区分大小写）
-    let windows_reserved = regex!("^(con|prn|aux|nul|com\\d|lpt\\d)$");
+    // Windows保留名称：CON, PRN, AUX, NUL, COM1-COM9, LPT1-LPT9（不区分大小写）。
+    // 「保留名 + 任意扩展名」（如 CON.mp4、aux.srt）在 Windows 上同样是非法文件名，
+    // 一并追加 `_` 处理。
+    let windows_reserved = regex!("^(con|prn|aux|nul|com\\d|lpt\\d)(\\..*)?$");
 
     // 全角字符映射
     let fullwidth_colon = regex!("："); // 全角冒号 → 半角冒号
@@ -176,9 +186,13 @@ pub fn filenamify_with_options<S: AsRef<str>>(input: S, preserve_template_separa
     // 5. 处理开头和结尾的点号
     input = replace_outer_periods(&input);
 
-    // 6. 检查Windows保留名称
-    if windows_reserved.is_match(&input.to_lowercase()) {
-        input.push_str(replacement);
+    // 6. 检查Windows保留名称。先去除首尾空白再匹配，避免 "con "（尾随空格）
+    //    绕过检查、随后在第 8 步 trim 后变成非法的裸保留名 "con"。
+    {
+        let trimmed = input.trim();
+        if windows_reserved.is_match(&trimmed.to_lowercase()) {
+            input = format!("{trimmed}_");
+        }
     }
 
     // 7. 去除多余的连续下划线和空格，但保留某些特殊情况
@@ -394,6 +408,43 @@ mod tests {
         assert_eq!(super::truncate_utf8_bytes("abc", 7), "abc");
         // 截断后残留的连字符会被清理，避免出现 "标题 - " 这类尾巴
         assert_eq!(super::truncate_utf8_bytes("中文标题 - 很长的标题", 14), "中文标题");
+    }
+
+    #[test]
+    fn test_reserved_names_with_surrounding_whitespace() {
+        // 首尾空白不应绕过 Windows 保留名检查（此前 "con " 经 trim 后会变成非法的 "con"）
+        assert_eq!(filenamify("con "), "con_");
+        assert_eq!(filenamify(" aux"), "aux_");
+        assert_eq!(filenamify("NUL  "), "NUL_");
+        assert_eq!(filenamify("  lpt3  "), "lpt3_");
+    }
+
+    #[test]
+    fn test_reserved_names_with_extension() {
+        // Windows 上「保留名 + 任意扩展名」（CON.mp4、aux.srt 等）同样是非法文件名
+        assert_eq!(filenamify("CON.mp4"), "CON.mp4_");
+        assert_eq!(filenamify("nul.srt"), "nul.srt_");
+        assert_eq!(filenamify("Com1.backup.mp4"), "Com1.backup.mp4_");
+        // 前缀相同但不构成「保留名+扩展名」的普通标题不受影响
+        assert_eq!(filenamify("aux评测.mp4"), "aux评测.mp4");
+        assert_eq!(filenamify("console.mp4"), "console.mp4");
+        assert_eq!(filenamify("com10.mp4"), "com10.mp4");
+    }
+
+    #[test]
+    fn test_plain_filenamify_preserves_template_separator_markers() {
+        // 模板渲染链路先把模板里的分隔符替换成 __UNIX_SEP__ / __WIN_SEP__ 标记，
+        // 渲染完成后再调用 filenamify 并最终还原。段尾空格/下划线与标记相邻时，
+        // 清理步骤（[_ ]{3,} → _ 等）不得吞掉标记前缀，否则分隔符永久丢失、
+        // 路径里会残留字面量 "_UNIX_SEP__"。
+        assert_eq!(filenamify("UP主 __UNIX_SEP__子目录"), "UP主 __UNIX_SEP__子目录");
+        assert_eq!(filenamify("UP主_ __UNIX_SEP__子目录"), "UP主_ __UNIX_SEP__子目录");
+        assert_eq!(filenamify("UP主   __WIN_SEP__子目录"), "UP主 __WIN_SEP__子目录");
+        // 标记原样保留的同时，内容中的真实斜杠仍照常替换为下划线
+        assert_eq!(
+            filenamify("分身/ドッペルゲンガー__UNIX_SEP__后缀"),
+            "分身_ドッペルゲンガー__UNIX_SEP__后缀"
+        );
     }
 
     #[test]
